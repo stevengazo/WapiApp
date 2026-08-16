@@ -1,0 +1,97 @@
+name: APK de pruebas
+
+# Genera un APK instalable y lo deja como artefacto de la ejecución (pestaña Summary → Artifacts).
+#
+#   · workflow_dispatch  → ejecución manual, permite elegir a qué API apunta el APK
+#   · tag vX.Y.Z         → una build por versión publicada
+#   · push a main        → APK siempre fresco para quien esté probando
+#
+# No necesita cuenta de Expo ni secretos. El proyecto se compila con `expo prebuild` + Gradle
+# dentro del runner, y la variante `release` que genera Expo va firmada con la keystore de debug
+# —la crea el propio prebuild—, así que el APK se instala y arranca sin más.
+#
+# Eso también significa que NO sirve para publicar: Google Play rechaza la firma de debug, y dos
+# APKs de aquí no se pueden actualizar entre sí si cambia la keystore. Es lo que se quiere para
+# pruebas y nada más. Para releases de verdad hace falta una keystore propia en secrets, o EAS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "URL de la API que llevará incrustada el APK"
+        required: false
+        default: "https://api.stevengazo.co.cr"
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+# Un push detrás de otro no necesita dos APKs: se cancela el anterior, que tarda ~15 min.
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Construir APK
+    runs-on: ubuntu-latest
+    env:
+      # Valor por defecto del campo «Conexión» de la app. Si se deja vacío manda `extra.apiBaseUrl`
+      # de app.json, y en cualquier caso el usuario puede cambiarlo desde Ajustes.
+      EXPO_PUBLIC_API_URL: ${{ inputs.api_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Configurar JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Configurar Gradle
+        # Cachea ~/.gradle entre ejecuciones. Sin esto cada build se baja Gradle y las
+        # dependencias de Android enteras.
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Chequeo de tipos
+        run: npm run typecheck
+
+      - name: Generar el proyecto nativo
+        # /android está en .gitignore: lo genera Expo a partir de app.json en cada build, así no
+        # hay una copia del proyecto nativo desincronizándose en el repo.
+        # --no-install porque las dependencias ya están puestas por `npm ci`.
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Compilar
+        # El bundle de JavaScript se crea aquí dentro, así que EXPO_PUBLIC_API_URL tiene que
+        # estar presente en este paso y no solo en el prebuild.
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Renombrar el APK
+        # El nombre lleva el nº de ejecución y el commit: con varios APKs en el móvil hace falta
+        # saber cuál es cuál, y la versión de app.json no cambia entre builds.
+        run: |
+          mkdir -p artefacto
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             "artefacto/wapi-${{ github.run_number }}-${GITHUB_SHA::7}.apk"
+          ls -lh artefacto
+
+      - name: Publicar el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wapi-apk-${{ github.run_number }}-${{ github.sha }}
+          path: artefacto/*.apk
+          if-no-files-found: error
+          retention-days: 14
